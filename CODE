@@ -1,0 +1,1473 @@
+
+; PIC16F877A Assembly - Adaptive Room Controller V10
+; Compiler: MPASM   Crystal: 4 MHz
+
+    LIST p=16F877A
+    #INCLUDE <p16F877A.inc>
+
+    __CONFIG _FOSC_XT & _WDTE_OFF & _PWRTE_ON & _BOREN_OFF & _LVP_OFF & _CPD_OFF & _WRT_OFF & _CP_OFF
+
+#DEFINE CALIBRATION_OFFSET  d'7'
+;Subtract 7 from LM35 reading
+; LM35 raw ADC value after averaging 16 samples and dividing by 32.
+; At 4MHz/10mV per C: 25 C -> raw ~25, 0 C -> raw ~0, 85 C -> raw ~85.
+; Disconnected LM35 floats: observe RAW_T in terminal when unplugged.
+; Set LM35_RAW_MIN just above the disconnected-float value.
+#DEFINE LM35_RAW_MIN        d'5'    ; SET FROM DIAGNOSTIC  (fault part
+#DEFINE LM35_RAW_MAX        d'85'   ; 85 C physical ceiling
+
+; Instability thresholds
+; Temp: change > 20 C between consecutive 100ms samples = wiring problem
+; LDR:  change > 50 percentage points = silent ignore (no fault)
+#DEFINE TEMP_INSTAB_THRESH  d'20'
+#DEFINE LDR_INSTAB_THRESH   d'50'
+
+; Consecutive bad readings required to confirm LM35 fault
+#DEFINE FAULT_CONFIRM       d'3' ;Need 3 bad readings before declaring a fault.
+
+; Startup grace: suppress fault_active for first 30 x 100ms = 3 seconds
+#DEFINE GRACE_TICKS         d'30'
+
+; Timer1 preload for 100 ms @ 4 MHz, prescaler 1:8,12500 countes before overflow
+#DEFINE TMR1H_PRELOAD       0xCF
+#DEFINE TMR1L_PRELOAD       0x2C
+
+; UART: 9600 baud, BRGH=1 @ 4 MHz
+#DEFINE UART_SPBRG          d'25'
+
+; Button debounce FSM states (evaluated once per 100ms tick)
+#DEFINE BTN_IDLE            d'0'
+#DEFINE BTN_PRESSED         d'1'
+#DEFINE BTN_HELD            d'2'
+
+; Occupancy indicator LEDs
+#DEFINE LED_GREEN  PORTC, 0     ; RC0 = Green LED (room occupied)
+#DEFINE LED_RED    PORTE, 0     ; RE0 = Red LED   (room empty)
+
+
+; Variable block - Bank 0, GPR from 0x20
+
+    CBLOCK 0x20
+        d1, d2     ;Used in delay loops.one for inner and one for outer loop
+        lcd_temp, lcd_data  ;Stores LCD command/data , temp:Temporary storage
+        loop_cnt       ;Loop counter.for adc samples
+        sum_H, sum_L    ;high and low byte 
+        raw_temp        ; Raw averaged LM35 value (pre-calibration)
+        temp_val            ; Calibrated temperature in degrees C
+        fan_speed           ;PWM duty cycle for fan
+        ldr_val             ; Light percentage 0-100
+        led_speed
+        math_val
+        bcd_hund, bcd_tens, bcd_ones
+        occupied            ; 0 = empty, 1 = occupied (derived from people_count)
+        mode_state          ; 0 = NORMAL, 1 = SAVE
+        ; Scheduler
+        tick_counter
+        lcd_tick
+        flag_sensor
+        flag_lcd
+        flag_timeout
+        flag_uart
+        inactivity_sec
+        ; ISR context
+        isr_temp_w
+        isr_temp_status
+        isr_temp_pclath
+        ; LM35 fault state only (LDR fault removed V10)
+        fault_lm35          ; 0=OK  1=confirmed LM35 fault
+        fault_active        ; mirrors fault_lm35 after grace period
+        confirm_lm35        ; Consecutive bad LM35 reading count (0-3)
+        instab_lm35         ; Consecutive unstable LM35 count    (0-3)
+        prev_temp           ; Previous calibrated temp for instability check
+        prev_ldr            ; Previous ldr% for silent instability check
+        startup_ticks       ; Grace period countdown (30->0)
+        abs_scratch         ; Scratch for absolute-value calculation
+        ; People counter and button debounce states (V9)
+        people_count        ; Number of people currently in room (0-5)
+        sw1_state           ; SW1 debounce FSM: 0=IDLE 1=PRESSED 2=HELD
+        sw2_state           ; SW2 debounce FSM: 0=IDLE 1=PRESSED 2=HELD
+    ENDC
+
+#DEFINE LCD_PORT PORTD
+#DEFINE LCD_RS   PORTD, 4
+#DEFINE LCD_EN   PORTD, 5
+
+; 
+; Reset and interrupt vectors
+; where to place the instructions 
+    ORG 0x0000 ;the Program Counter automatically starts from address 0000h,reset address
+    GOTO    START
+    ORG 0x0004 ;datasheet page 15
+    GOTO    ISR ;Whenever an enabled interrupt occurs, the PIC automatically jumps to address 0004h
+
+; 
+; START 
+; 
+START:
+    BSF     STATUS, RP0
+    BCF     STATUS, RP1
+    BSF     TRISB, 4            ; RB4 = SW1 input (Enter)
+    BSF     TRISB, 5            ; RB5 = SW2 input (Leave)
+
+    BSF     STATUS, RP0
+    BCF     STATUS, RP1
+    CLRF    TRISD               ; PORTD = output (LCD) ,LCD receives data from PIC.
+;both in bank1 .page 16
+    BSF     STATUS, RP0
+    BCF     STATUS, RP1
+    BCF     TRISC, 2            ; RC2 = CCP1 output (Fan PWM)
+    BCF     TRISC, 1            ; RC1 = CCP2 output (LED PWM)
+    BCF     TRISC, 6            ; RC6 = TX output
+    BSF     TRISC, 7            ; RC7 = RX input
+    BCF     TRISC, 0            ; RC0 = Green LED output
+
+    BSF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVLW   b'00000110'         ; RA1, RA2 as analogue inputs lm ,ldr
+    MOVWF   TRISA
+    MOVLW   b'10000000'         ; ADCON1: right-justified, Vdd/Vss refs
+    MOVWF   ADCON1 ;page 127 126
+
+    ; RE0 = Red LED output
+    BSF     STATUS, RP0
+    BCF     STATUS, RP1
+    BCF     TRISE, 0            ; RE0 = output (Red LED)
+
+    ; Timer2 + PWM period
+    BSF     STATUS, RP0 ;page 61
+    BCF     STATUS, RP1
+    MOVLW   d'100'              ; PR2 = 100: PWM period maps directly to %,used in freqncy
+    MOVWF   PR2
+
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVLW   b'00001100'         ; CCP1 = PWM mode (Fan)
+    MOVWF   CCP1CON
+
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVLW   b'00001100'         ; CCP2 = PWM mode (LED)
+    MOVWF   CCP2CON
+
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVLW   b'00000101'  ; Timer2 ON, prescaler = 4 we chosed that which is suitable for fan /led and it produce the desired pwm
+    MOVWF   T2CON ;page 62.63
+
+    ; Timer1: 100 ms interrupt, prescaler 1:8, internal clock
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVLW   b'00110001' ;as intrupt and changes happens after 100ms
+    MOVWF   T1CON ;page 57
+    MOVLW   TMR1H_PRELOAD
+    MOVWF   TMR1H
+    MOVLW   TMR1L_PRELOAD
+    MOVWF   TMR1L
+    ;preload:The start happens at 53036 till ffff 65536, we subtract them we have 12500 count 
+    ;untill overflow occurs then intrupt happens
+    ; Enable Timer1 interrupt
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    BCF     PIR1, TMR1IF ;if =1 , pic may think overflow happend,page 57,26
+    BSF     STATUS, RP0
+    BCF     STATUS, RP1 ;bank1
+    BSF     PIE1, TMR1IE ;that overflow event to generate an interrupt.page 25
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    BSF     INTCON, PEIE;page 26
+    BSF     INTCON, GIE ;page 24
+;1. Clear old flag
+;2. Enable Timer1 interrupt
+;3. Enable peripheral interrupts
+;4. Enable global interrupts
+    ;Jump to ISR at 0004h
+    CALL    UART_INIT; after configure ports intrupts,,,we go to uart loop
+
+    ; LCD startup
+    CALL    DELAY_15MS ;Wait for LCD power-up stabilization
+    CALL    LCD_INIT ; Initialize LCD settings
+    MOVLW   0x01 ; Load LCD clear display command
+    CALL    LCD_CMD ;Send command to LCD
+    CALL    DELAY_5MS ;Allow LCD processing time
+
+    ; Initialise all state
+    CLRF    occupied
+    CLRF    mode_state
+    CLRF    tick_counter
+    CLRF    lcd_tick
+    CLRF    inactivity_sec
+    CLRF    flag_sensor
+    CLRF    flag_lcd
+    CLRF    flag_timeout
+    CLRF    flag_uart
+    CLRF    fault_lm35
+    CLRF    fault_active
+    CLRF    confirm_lm35
+    CLRF    instab_lm35
+    CLRF    prev_temp
+    CLRF    prev_ldr
+    CLRF    raw_temp
+    MOVLW   GRACE_TICKS
+    MOVWF   startup_ticks ;3 sec for fault detection ,at start it gives the sensor to read for 3 sec then if the readings still bad then send fault 
+
+    ; People counter and debounce states
+    CLRF    people_count
+    CLRF    sw1_state
+    CLRF    sw2_state 
+
+    ; Startup LED state: people_count=0 -> Red ON, Green OFF
+    BCF     STATUS, RP0 ;PORTC and PORTE are in Bank 0.
+    BCF     STATUS, RP1
+    BCF     LED_GREEN ;at the beginning green on and red is off
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    BSF     LED_RED
+
+; 
+; MAIN_LOOP - cooperative flag-driven scheduler
+;
+MAIN_LOOP:
+
+    ; ------------------------------------------------------------------
+    ; TASK 1: Sensor sampling + PWM + debounce + LED update - 100 ms
+    ;
+    ; Execution order inside this task:
+    ;   1. Decrement grace period counter
+    ;   2. Button debounce FSM (SW1/SW2)
+    ;   3. Derive occupied from people_count
+    ;   4. Update occupancy LEDs
+    ;   5. LM35 read, validate, fault detection, fan PWM
+    ;   6. LDR read, validate (silent), LED PWM
+    ;   7. Compute fault_active
+    ; ------------------------------------------------------------------
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVF    flag_sensor, F ;It updates the Z bit.
+    ;page 160, at ISR part FS=1 then task 1 is requested 
+    ;if FS=0 no sensor readings update ,it clears after task is finished 
+    BTFSC   STATUS, Z; if z=0 skip instruction /if z=1 excute instruction
+    ; page 160,24 zero bit(Bit Test File, Skip if Clear
+    ;btfsc and movf ,togther they creat if condition
+    ;we used movf as it do 2 things togther 
+    GOTO    SKIP_SENSOR
+
+    BCF     INTCON, GIE ;disable timer intrupt then flag sensor
+    CLRF    flag_sensor
+    BSF     INTCON, GIE
+    ;this part ensure runs only once per timer inptrupt
+
+    ; ------------------------------------------------------------------
+    ; this part helps at the start of the program avoid 
+    ;wrong fult detection and wait 3 sec for the lm to stblize
+    ; 
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVF    startup_ticks, F
+    BTFSC   STATUS, Z ;if z=1 excute goto
+    GOTO    GRACE_DONE
+    DECF    startup_ticks, F
+GRACE_DONE:
+
+    ; ------------------------------------------------------------------
+    ; BUTTON DEBOUNCE AND PEOPLE COUNTER
+    ; FSM per button: IDLE+LOW->PRESSED(fire once); LOW again->HELD(no action)
+    ;                 HIGH(any state)->IDLE
+    ; ------------------------------------------------------------------
+
+    ; ---- SW1 (RB4) - ENTER ----
+    BCF     STATUS, RP0 ;portb in bank 0
+    BCF     STATUS, RP1
+    BTFSC   PORTB, 4            ; Skip if RB4 LOW clear (pressed)
+    GOTO    SW1_RELEASED        ; HIGH = not pressed
+    MOVF    sw1_state, W ;sw1 state =0 at the top
+    XORLW   BTN_IDLE ;compare w with ..
+    BTFSS   STATUS, Z
+    GOTO    SW1_NOT_IDLE
+    ; IDLE + LOW: fire action
+    MOVLW   d'5'
+    SUBWF   people_count, W     ; W = people_count - 5
+    BTFSC   STATUS, C           ; C=1: people_count >= 5
+    GOTO    SW1_AT_MAX
+    INCF    people_count, F
+SW1_AT_MAX:
+    MOVLW   BTN_PRESSED
+    MOVWF   sw1_state
+    GOTO    SW1_DONE
+SW1_NOT_IDLE:
+    MOVLW   BTN_HELD
+    MOVWF   sw1_state
+    GOTO    SW1_DONE
+SW1_RELEASED:
+    CLRF    sw1_state
+SW1_DONE:
+
+    ; ---- SW2 (RB5) - LEAVE ----
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    BTFSC   PORTB, 5            ; Skip if RB5 LOW (pressed)
+    GOTO    SW2_RELEASED
+    MOVF    sw2_state, W
+    XORLW   BTN_IDLE
+    BTFSS   STATUS, Z
+    GOTO    SW2_NOT_IDLE
+    ; IDLE + LOW: fire action
+    MOVF    people_count, F
+    BTFSC   STATUS, Z
+    GOTO    SW2_AT_MIN
+    DECF    people_count, F
+SW2_AT_MIN:
+    MOVLW   BTN_PRESSED
+    MOVWF   sw2_state
+    GOTO    SW2_DONE
+SW2_NOT_IDLE:
+    MOVLW   BTN_HELD
+    MOVWF   sw2_state
+    GOTO    SW2_DONE
+SW2_RELEASED:
+    CLRF    sw2_state
+SW2_DONE:
+
+    ; ------------------------------------------------------------------
+    ; DERIVE occupied FROM people_count
+    ; occupied = 1 if people_count > 0, else 0
+    ; ------------------------------------------------------------------
+    CLRF    occupied
+    MOVF    people_count, F
+    BTFSS   STATUS, Z
+    MOVLW   1
+    BTFSS   STATUS, Z
+    MOVWF   occupied
+
+    ; ------------------------------------------------------------------
+    ; OCCUPANCY LED UPDATE
+    ; people_count > 0 : Green ON,  Red OFF
+    ; people_count = 0 : Green OFF, Red ON
+    ; ------------------------------------------------------------------
+    MOVF    occupied, F
+    BTFSS   STATUS, Z
+    GOTO    OCC_LED_ON
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    BCF     LED_GREEN
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    BSF     LED_RED
+    GOTO    OCC_LED_DONE
+OCC_LED_ON:
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    BSF     LED_GREEN
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    BCF     LED_RED
+OCC_LED_DONE:
+
+    ; 
+    ; LM35 READ + VALIDATION + FAULT DETECTION
+    ; 
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVLW   b'10001001'         ; Channel AN1, ADC ON
+    MOVWF   ADCON0
+    CALL    DELAY_5MS
+
+    CLRF    sum_H
+    CLRF    sum_L
+    MOVLW   d'16'
+    MOVWF   loop_cnt
+
+TAKE_TEMP:
+    BSF     ADCON0, 2
+WAIT_TEMP:
+    BTFSC   ADCON0, 2
+    GOTO    WAIT_TEMP
+    BSF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVF    ADRESL, W
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    ADDWF   sum_L, F
+    BTFSC   STATUS, C
+    INCF    sum_H, F
+    MOVF    ADRESH, W
+    ADDWF   sum_H, F
+    DECFSZ  loop_cnt, F
+    GOTO    TEMP_NEXT
+    GOTO    TEMP_DIV
+TEMP_NEXT:
+    CALL    DELAY_100US
+    GOTO    TAKE_TEMP
+
+TEMP_DIV:
+    ; 5 right-shifts: divide 16-sample sum by 32
+    MOVLW   d'5'
+    MOVWF   loop_cnt
+SHIFT_TEMP:
+    BCF     STATUS, C
+    RRF     sum_H, F
+    RRF     sum_L, F
+    DECFSZ  loop_cnt, F
+    GOTO    SHIFT_TEMP
+
+    MOVF    sum_L, W
+    MOVWF   raw_temp
+
+    ; ----------------------------------------------------------
+    ; LM35 RANGE CHECK (on raw pre-calibration value)
+    ; Reject if raw_temp < LM35_RAW_MIN or raw_temp > LM35_RAW_MAX
+    ; ----------------------------------------------------------
+    MOVLW   LM35_RAW_MIN
+    SUBWF   raw_temp, W         ; W = raw_temp - LM35_RAW_MIN
+    BTFSS   STATUS, C           ; C=0: raw_temp < MIN
+    GOTO    TEMP_RANGE_BAD
+
+    MOVLW   LM35_RAW_MAX
+    SUBWF   raw_temp, W         ; W = raw_temp - LM35_RAW_MAX
+    BTFSC   STATUS, C           ; C=1: raw_temp >= MAX (too high)
+    GOTO    TEMP_RANGE_BAD
+    BTFSS   STATUS, Z           ; Z=1: raw_temp == MAX (also bad)
+    GOTO    TEMP_RANGE_OK
+
+TEMP_RANGE_BAD:
+    INCF    confirm_lm35, F
+    MOVLW   FAULT_CONFIRM
+    SUBWF   confirm_lm35, W
+    BTFSC   STATUS, C
+    GOTO    RAISE_LM35_FAULT
+    GOTO    TEMP_APPLY_CAL
+
+TEMP_RANGE_OK:
+    CLRF    confirm_lm35
+
+TEMP_APPLY_CAL:
+    ; Apply calibration offset with underflow clamp
+    MOVF    raw_temp, W
+    MOVWF   temp_val
+    MOVLW   CALIBRATION_OFFSET
+    SUBWF   temp_val, F
+    BTFSS   STATUS, C
+    CLRF    temp_val
+
+    ; ----------------------------------------------------------
+    ; LM35 INSTABILITY CHECK (on calibrated value)
+    ; Reject if |temp_val - prev_temp| > TEMP_INSTAB_THRESH
+    ; ----------------------------------------------------------
+    MOVF    temp_val, W
+    SUBWF   prev_temp, W        ; W = prev_temp - temp_val
+    BTFSC   STATUS, C
+    GOTO    TEMP_ABS_POS
+    SUBLW   0                   ; Negate if negative
+TEMP_ABS_POS:
+    MOVWF   abs_scratch
+
+    MOVLW   TEMP_INSTAB_THRESH
+    SUBWF   abs_scratch, W      ; W = abs_diff - threshold
+    BTFSC   STATUS, C           ; C=1: abs_diff >= threshold
+    GOTO    TEMP_INSTAB_BAD
+
+    CLRF    instab_lm35
+    GOTO    TEMP_SAVE_PREV
+
+TEMP_INSTAB_BAD:
+    INCF    instab_lm35, F
+    MOVLW   FAULT_CONFIRM
+    SUBWF   instab_lm35, W
+    BTFSC   STATUS, C
+    GOTO    RAISE_LM35_FAULT
+    GOTO    TEMP_SAVE_PREV
+
+RAISE_LM35_FAULT:
+    MOVLW   1
+    MOVWF   fault_lm35
+    MOVLW   FAULT_CONFIRM
+    MOVWF   confirm_lm35
+    MOVWF   instab_lm35
+    GOTO    TEMP_SAVE_PREV
+
+TEMP_SAVE_PREV:
+    ; Clear fault only if both counters are zero
+    MOVF    confirm_lm35, W
+    ADDWF   instab_lm35, W
+    BTFSC   STATUS, Z
+    CLRF    fault_lm35
+
+    MOVF    temp_val, W
+    MOVWF   prev_temp
+
+    GOTO    TEMP_FAN
+
+    NOP
+
+TEMP_FAN:
+    ; Fan threshold logic
+    MOVLW   d'25'
+    SUBWF   temp_val, W
+    BTFSS   STATUS, C
+    GOTO    FAN_0
+    MOVLW   d'27'
+    SUBWF   temp_val, W
+    BTFSS   STATUS, C
+    GOTO    FAN_50
+    GOTO    FAN_100
+
+FAN_0:   MOVLW d'0'
+         GOTO  UPDATE_FAN
+FAN_50:  MOVLW d'50'
+         GOTO  UPDATE_FAN
+FAN_100: MOVLW d'100'
+
+UPDATE_FAN:
+    ; LM35 fault: force fan off
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVF    fault_lm35, F
+    BTFSS   STATUS, Z
+    GOTO    FAN_OFF
+
+    ; SAVE mode: fan off
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    BTFSS   mode_state, 0
+    GOTO    FAN_WRITE
+
+FAN_OFF:
+    CLRF    fan_speed
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    CLRF    CCPR1L
+    GOTO    FAN_DONE
+
+FAN_WRITE:
+    ; PWM overflow protection: clamp to 100 max
+    MOVWF   fan_speed
+    MOVLW   d'101'
+    SUBWF   fan_speed, W
+    BTFSS   STATUS, C
+    GOTO    FAN_WRITE_OK
+    MOVLW   d'100'
+    MOVWF   fan_speed
+FAN_WRITE_OK:
+    MOVF    fan_speed, W
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVWF   CCPR1L
+FAN_DONE:
+
+    
+    ; LDR READ + SILENT VALIDATION (no fault raised)
+    ; Invalid or unstable readings: keep previous ldr_val unchanged
+    ; ---------------------------------
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVLW   b'10010001'         ; Channel AN2, ADC ON
+    MOVWF   ADCON0
+    CALL    DELAY_5MS
+
+    CLRF    sum_H
+    CLRF    sum_L
+    MOVLW   d'16'
+    MOVWF   loop_cnt
+
+TAKE_LDR:
+    BSF     ADCON0, 2
+WAIT_LDR:
+    BTFSC   ADCON0, 2
+    GOTO    WAIT_LDR
+    BSF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVF    ADRESL, W
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    ADDWF   sum_L, F
+    BTFSC   STATUS, C
+    INCF    sum_H, F
+    MOVF    ADRESH, W
+    ADDWF   sum_H, F
+    DECFSZ  loop_cnt, F
+    GOTO    LDR_NEXT
+    GOTO    LDR_DIV
+LDR_NEXT:
+    CALL    DELAY_100US
+    GOTO    TAKE_LDR
+
+LDR_DIV:
+    ; 7 right-shifts: divide 16-sample sum by 128 -> range 0-127
+    MOVLW   d'7'
+    MOVWF   loop_cnt
+SHIFT_LDR:
+    BCF     STATUS, C
+    RRF     sum_H, F
+    RRF     sum_L, F
+    DECFSZ  loop_cnt, F
+    GOTO    SHIFT_LDR
+
+    ; Scale and cap to 0-100
+    MOVF    sum_L, W
+    MOVWF   ldr_val
+    MOVLW   d'100'
+    SUBWF   ldr_val, W
+    BTFSS   STATUS, C
+    GOTO    LDR_SCALE_OK        ; ldr_val <= 100: fine
+    MOVLW   d'100'
+    MOVWF   ldr_val
+LDR_SCALE_OK:
+
+    ; ----------------------------------------------------------
+    ; LDR INSTABILITY CHECK (silent - no fault)
+    ; If |ldr_val - prev_ldr| > LDR_INSTAB_THRESH: keep previous
+    ; ----------------------------------------------------------
+    MOVF    ldr_val, W
+    SUBWF   prev_ldr, W         ; W = prev_ldr - ldr_val
+    BTFSC   STATUS, C
+    GOTO    LDR_ABS_POS
+    SUBLW   0
+LDR_ABS_POS:
+    MOVWF   abs_scratch
+
+    MOVLW   LDR_INSTAB_THRESH
+    SUBWF   abs_scratch, W      ; W = abs_diff - threshold
+    BTFSC   STATUS, C           ; C=1: unstable -> keep previous
+    GOTO    LDR_INSTAB_BAD
+
+    ; Stable: accept new ldr_val
+    MOVF    ldr_val, W
+    MOVWF   prev_ldr
+    GOTO    LDR_LED
+
+LDR_INSTAB_BAD:
+    ; Silently keep previous ldr_val
+    MOVF    prev_ldr, W
+    MOVWF   ldr_val
+
+LDR_LED:
+    ; LED brightness zone logic (on validated ldr_val)
+    ;   ldr_val  < 20% -> LED 100%
+    ;   ldr_val  < 40% -> LED  60%
+    ;   ldr_val  < 60% -> LED  20%
+    ;   ldr_val >= 60% -> LED   0%
+    MOVLW   d'20'
+    SUBWF   ldr_val, W
+    BTFSS   STATUS, C
+    GOTO    LED_100
+    MOVLW   d'40'
+    SUBWF   ldr_val, W
+    BTFSS   STATUS, C
+    GOTO    LED_60
+    MOVLW   d'60'
+    SUBWF   ldr_val, W
+    BTFSS   STATUS, C
+    GOTO    LED_20
+    GOTO    LED_0
+
+LED_100: MOVLW d'100'
+         GOTO  UPDATE_LED
+LED_60:  MOVLW d'60'
+         GOTO  UPDATE_LED
+LED_20:  MOVLW d'20'
+         GOTO  UPDATE_LED
+LED_0:   MOVLW d'0'
+
+UPDATE_LED:
+    ; SAVE mode: LED at minimum 20%
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    BTFSS   mode_state, 0
+    GOTO    LED_WRITE
+    MOVLW   d'20'
+    MOVWF   led_speed
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVWF   CCPR2L
+    GOTO    LED_DONE
+
+LED_WRITE:
+    ; PWM overflow protection: clamp to 100 max
+    MOVWF   led_speed
+    MOVLW   d'101'
+    SUBWF   led_speed, W
+    BTFSS   STATUS, C
+    GOTO    LED_WRITE_OK
+    MOVLW   d'100'
+    MOVWF   led_speed
+LED_WRITE_OK:
+    MOVF    led_speed, W
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVWF   CCPR2L
+LED_DONE:
+
+    ; 
+    ; Compute fault_active (LM35 only, suppressed during grace period)
+    ; -----------------------------------------------
+    MOVF    fault_lm35, W
+    BTFSC   STATUS, Z
+    GOTO    FAULTS_CLEAR        ; fault_lm35 = 0: no fault
+
+    ; Fault present: check grace period
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVF    startup_ticks, F
+    BTFSS   STATUS, Z
+    GOTO    FAULTS_CLEAR        ; Grace not expired: suppress
+
+    MOVLW   1
+    MOVWF   fault_active
+    GOTO    SENSOR_END
+
+FAULTS_CLEAR:
+    CLRF    fault_active
+
+SENSOR_END:
+
+SKIP_SENSOR:
+
+    ; ------------------------------------------------------------------
+    ; TASK 2: LCD refresh - every 500 ms
+    ;
+    ; Normal display:
+    ;   Line 1: T:XXX°C F:XXX% N/S    (16 chars)
+    ;   Line 2: P:X L:XXX E:XXX        (16 chars)
+    ;
+    ; Fault display (fault_active = 1):
+    ;   Line 1: SENSOR ERR             (16 chars)
+    ;   Line 2: LM35 FAIL              (16 chars)
+    ; ------------------------------------------------------------------
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVF    flag_lcd, F
+    BTFSC   STATUS, Z
+    GOTO    SKIP_LCD
+
+    BCF     INTCON, GIE
+    CLRF    flag_lcd
+    BSF     INTCON, GIE
+
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVF    fault_active, F
+    BTFSS   STATUS, Z
+    GOTO    LCD_FAULT_DISPLAY
+
+    ; --- Normal Line 1: T:XXX°C F:XXX% N/S ---
+    MOVLW   0x80
+    CALL    LCD_CMD
+    MOVLW   'T'
+    CALL    LCD_CHAR
+    MOVLW   ':'
+    CALL    LCD_CHAR
+    MOVF    temp_val, W
+    MOVWF   math_val
+    CALL    BIN2BCD_8BIT
+    MOVF    bcd_hund, W
+    ADDLW   0x30
+    CALL    LCD_CHAR
+    MOVF    bcd_tens, W
+    ADDLW   0x30
+    CALL    LCD_CHAR
+    MOVF    bcd_ones, W
+    ADDLW   0x30
+    CALL    LCD_CHAR
+    MOVLW   0xDF
+    CALL    LCD_CHAR
+    MOVLW   'C'
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   'F'
+    CALL    LCD_CHAR
+    MOVLW   ':'
+    CALL    LCD_CHAR
+    MOVF    fan_speed, W
+    MOVWF   math_val
+    CALL    BIN2BCD_8BIT
+    MOVF    bcd_hund, W
+    ADDLW   0x30
+    CALL    LCD_CHAR
+    MOVF    bcd_tens, W
+    ADDLW   0x30
+    CALL    LCD_CHAR
+    MOVF    bcd_ones, W
+    ADDLW   0x30
+    CALL    LCD_CHAR
+    MOVLW   '%'
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    BTFSS   mode_state, 0
+    GOTO    LCD_NORM
+    MOVLW   'S'
+    CALL    LCD_CHAR
+    GOTO    LCD_LINE2
+LCD_NORM:
+    MOVLW   'N'
+    CALL    LCD_CHAR
+    GOTO    LCD_LINE2
+
+    ; --- Fault display ---
+LCD_FAULT_DISPLAY:
+    ; Line 1: SENSOR ERR (padded to 16)
+    MOVLW   0x80
+    CALL    LCD_CMD
+    MOVLW   'S'
+    CALL    LCD_CHAR
+    MOVLW   'E'
+    CALL    LCD_CHAR
+    MOVLW   'N'
+    CALL    LCD_CHAR
+    MOVLW   'S'
+    CALL    LCD_CHAR
+    MOVLW   'O'
+    CALL    LCD_CHAR
+    MOVLW   'R'
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   'E'
+    CALL    LCD_CHAR
+    MOVLW   'R'
+    CALL    LCD_CHAR
+    MOVLW   'R'
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+
+    ; Line 2: LM35 FAIL (padded to 16)
+    MOVLW   0xC0
+    CALL    LCD_CMD
+    MOVLW   'L'
+    CALL    LCD_CHAR
+    MOVLW   'M'
+    CALL    LCD_CHAR
+    MOVLW   '3'
+    CALL    LCD_CHAR
+    MOVLW   '5'
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   'F'
+    CALL    LCD_CHAR
+    MOVLW   'A'
+    CALL    LCD_CHAR
+    MOVLW   'I'
+    CALL    LCD_CHAR
+    MOVLW   'L'
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    GOTO    SKIP_LCD
+
+LCD_LINE2:
+    ; --- Normal Line 2: P:X L:XXX E:XXX ---
+    ; Character map (positions 1-16):
+    ; P : X _ L : X X X _ E : X X X _
+    ; 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16
+    MOVLW   0xC0
+    CALL    LCD_CMD
+
+    ; P: single digit (chars 1-3)
+    MOVLW   'P'
+    CALL    LCD_CHAR
+    MOVLW   ':'
+    CALL    LCD_CHAR
+    MOVF    people_count, W
+    MOVWF   math_val
+    CALL    BIN2BCD_8BIT
+    MOVF    bcd_ones, W
+    ADDLW   0x30
+    CALL    LCD_CHAR
+
+    ; space (char 4)
+    MOVLW   ' '
+    CALL    LCD_CHAR
+
+    ; L:XXX (chars 5-9)
+    MOVLW   'L'
+    CALL    LCD_CHAR
+    MOVLW   ':'
+    CALL    LCD_CHAR
+    MOVF    ldr_val, W
+    MOVWF   math_val
+    CALL    BIN2BCD_8BIT
+    MOVF    bcd_hund, W
+    ADDLW   0x30
+    CALL    LCD_CHAR
+    MOVF    bcd_tens, W
+    ADDLW   0x30
+    CALL    LCD_CHAR
+    MOVF    bcd_ones, W
+    ADDLW   0x30
+    CALL    LCD_CHAR
+
+    ; space (char 10)
+    MOVLW   ' '
+    CALL    LCD_CHAR
+
+    ; E:XXX (chars 11-15)
+    MOVLW   'E'
+    CALL    LCD_CHAR
+    MOVLW   ':'
+    CALL    LCD_CHAR
+    MOVF    led_speed, W
+    MOVWF   math_val
+    CALL    BIN2BCD_8BIT
+    MOVF    bcd_hund, W
+    ADDLW   0x30
+    CALL    LCD_CHAR
+    MOVF    bcd_tens, W
+    ADDLW   0x30
+    CALL    LCD_CHAR
+    MOVF    bcd_ones, W
+    ADDLW   0x30
+    CALL    LCD_CHAR
+
+    ; trailing space (char 16)
+    MOVLW   ' '
+    CALL    LCD_CHAR
+
+SKIP_LCD:
+
+    ; ------------------------------------------------------------------
+    ; TASK 3: Inactivity timeout - every 1 second
+    ;
+    ; occupied derived from people_count (updated in sensor task).
+    ; If occupied=0 for 5 consecutive seconds: SAVE mode.
+    ; If occupied=1: NORMAL mode immediately, reset counter.
+    ; ------------------------------------------------------------------
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVF    flag_timeout, F
+    BTFSC   STATUS, Z
+    GOTO    SKIP_TIMEOUT
+
+    BCF     INTCON, GIE
+    CLRF    flag_timeout
+    BSF     INTCON, GIE
+
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVF    occupied, F
+    BTFSS   STATUS, Z
+    GOTO    RESET_INACTIVITY
+
+    INCF    inactivity_sec, F
+    MOVLW   d'5'
+    SUBWF   inactivity_sec, W
+    BTFSS   STATUS, C
+    GOTO    SKIP_TIMEOUT
+
+    MOVLW   1
+    MOVWF   mode_state
+    CLRF    inactivity_sec
+    GOTO    SKIP_TIMEOUT
+
+RESET_INACTIVITY:
+    CLRF    inactivity_sec
+    CLRF    mode_state
+
+SKIP_TIMEOUT:
+
+    ; ------------------------------------------------------------------
+    ; TASK 4: UART status report - every 1 second
+    ;
+    ; Format:
+    ;   TEMP=DDC LIGHT=DDD% FAN=DDD% LED=DDD% PEOPLE=DDD MODE=NNNNNN FAULT=XXXXX\r\n
+    ;   FAULT field = LM35  or NONE
+    ; ------------------------------------------------------------------
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVF    flag_uart, F
+    BTFSC   STATUS, Z
+    GOTO    SKIP_UART
+
+    BCF     INTCON, GIE
+    CLRF    flag_uart
+    BSF     INTCON, GIE
+
+    CALL    UART_REPORT
+
+SKIP_UART:
+    GOTO    MAIN_LOOP
+
+; 
+; ISR - Timer1 100 ms scheduler tick engine (unchanged)
+; 
+ISR:
+    MOVWF   isr_temp_w
+    SWAPF   STATUS, W
+    CLRF    STATUS
+    MOVWF   isr_temp_status
+    MOVF    PCLATH, W
+    MOVWF   isr_temp_pclath
+    CLRF    PCLATH
+
+    BTFSS   PIR1, TMR1IF
+    GOTO    ISR_EXIT
+
+    BCF     PIR1, TMR1IF
+
+    MOVLW   TMR1H_PRELOAD
+    MOVWF   TMR1H
+    MOVLW   TMR1L_PRELOAD
+    MOVWF   TMR1L
+
+    MOVLW   1
+    MOVWF   flag_sensor
+
+    INCF    lcd_tick, F
+    MOVLW   d'5'
+    SUBWF   lcd_tick, W
+    BTFSS   STATUS, Z
+    GOTO    ISR_CHECK_TIMEOUT
+    CLRF    lcd_tick
+    MOVLW   1
+    MOVWF   flag_lcd
+
+ISR_CHECK_TIMEOUT:
+    INCF    tick_counter, F
+    MOVLW   d'10'
+    SUBWF   tick_counter, W
+    BTFSS   STATUS, Z
+    GOTO    ISR_EXIT
+    CLRF    tick_counter
+    MOVLW   1
+    MOVWF   flag_timeout
+    MOVLW   1
+    MOVWF   flag_uart
+
+ISR_EXIT:
+    MOVF    isr_temp_pclath, W
+    MOVWF   PCLATH
+    SWAPF   isr_temp_status, W
+    MOVWF   STATUS
+    SWAPF   isr_temp_w, F
+    SWAPF   isr_temp_w, W
+    RETFIE
+
+; ==============================================================================
+; UART_INIT - 9600 baud, async, 8-bit, TX only
+; ==============================================================================
+UART_INIT:
+    BSF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVLW   b'00100100'         ; TXEN=1, SYNC=0, BRGH=1
+    MOVWF   TXSTA
+    MOVLW   UART_SPBRG
+    MOVWF   SPBRG
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVLW   b'10000000'         ; SPEN=1
+    MOVWF   RCSTA
+    RETURN
+
+; ==============================================================================
+; UART_CHAR - transmit W, poll TXIF
+; ==============================================================================
+UART_CHAR:
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+UC_WAIT:
+    BTFSS   PIR1, TXIF
+    GOTO    UC_WAIT
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVWF   TXREG
+    RETURN
+
+; ==============================================================================
+; UART_REPORT
+; Format: TEMP=DDC LIGHT=DDD% FAN=DDD% LED=DDD% PEOPLE=DDD MODE=NNNNNN FAULT=XXXXX\r\n
+; ==============================================================================
+UART_REPORT:
+
+    ; TEMP=
+    MOVLW   'T'
+    CALL    UART_CHAR
+    MOVLW   'E'
+    CALL    UART_CHAR
+    MOVLW   'M'
+    CALL    UART_CHAR
+    MOVLW   'P'
+    CALL    UART_CHAR
+    MOVLW   '='
+    CALL    UART_CHAR
+    MOVF    temp_val, W
+    MOVWF   math_val
+    CALL    BIN2BCD_8BIT
+    MOVF    bcd_hund, W
+    ADDLW   0x30
+    CALL    UART_CHAR
+    MOVF    bcd_tens, W
+    ADDLW   0x30
+    CALL    UART_CHAR
+    MOVF    bcd_ones, W
+    ADDLW   0x30
+    CALL    UART_CHAR
+    MOVLW   'C'
+    CALL    UART_CHAR
+    MOVLW   ' '
+    CALL    UART_CHAR
+
+    ; LIGHT=
+    MOVLW   'L'
+    CALL    UART_CHAR
+    MOVLW   'I'
+    CALL    UART_CHAR
+    MOVLW   'G'
+    CALL    UART_CHAR
+    MOVLW   'H'
+    CALL    UART_CHAR
+    MOVLW   'T'
+    CALL    UART_CHAR
+    MOVLW   '='
+    CALL    UART_CHAR
+    MOVF    ldr_val, W
+    MOVWF   math_val
+    CALL    BIN2BCD_8BIT
+    MOVF    bcd_hund, W
+    ADDLW   0x30
+    CALL    UART_CHAR
+    MOVF    bcd_tens, W
+    ADDLW   0x30
+    CALL    UART_CHAR
+    MOVF    bcd_ones, W
+    ADDLW   0x30
+    CALL    UART_CHAR
+    MOVLW   '%'
+    CALL    UART_CHAR
+    MOVLW   ' '
+    CALL    UART_CHAR
+
+    ; FAN=
+    MOVLW   'F'
+    CALL    UART_CHAR
+    MOVLW   'A'
+    CALL    UART_CHAR
+    MOVLW   'N'
+    CALL    UART_CHAR
+    MOVLW   '='
+    CALL    UART_CHAR
+    MOVF    fan_speed, W
+    MOVWF   math_val
+    CALL    BIN2BCD_8BIT
+    MOVF    bcd_hund, W
+    ADDLW   0x30
+    CALL    UART_CHAR
+    MOVF    bcd_tens, W
+    ADDLW   0x30
+    CALL    UART_CHAR
+    MOVF    bcd_ones, W
+    ADDLW   0x30
+    CALL    UART_CHAR
+    MOVLW   '%'
+    CALL    UART_CHAR
+    MOVLW   ' '
+    CALL    UART_CHAR
+
+    ; LED=
+    MOVLW   'L'
+    CALL    UART_CHAR
+    MOVLW   'E'
+    CALL    UART_CHAR
+    MOVLW   'D'
+    CALL    UART_CHAR
+    MOVLW   '='
+    CALL    UART_CHAR
+    MOVF    led_speed, W
+    MOVWF   math_val
+    CALL    BIN2BCD_8BIT
+    MOVF    bcd_hund, W
+    ADDLW   0x30
+    CALL    UART_CHAR
+    MOVF    bcd_tens, W
+    ADDLW   0x30
+    CALL    UART_CHAR
+    MOVF    bcd_ones, W
+    ADDLW   0x30
+    CALL    UART_CHAR
+    MOVLW   '%'
+    CALL    UART_CHAR
+    MOVLW   ' '
+    CALL    UART_CHAR
+
+    ; PEOPLE=
+    MOVLW   'P'
+    CALL    UART_CHAR
+    MOVLW   'E'
+    CALL    UART_CHAR
+    MOVLW   'O'
+    CALL    UART_CHAR
+    MOVLW   'P'
+    CALL    UART_CHAR
+    MOVLW   'L'
+    CALL    UART_CHAR
+    MOVLW   'E'
+    CALL    UART_CHAR
+    MOVLW   '='
+    CALL    UART_CHAR
+    MOVF    people_count, W
+    MOVWF   math_val
+    CALL    BIN2BCD_8BIT
+    MOVF    bcd_hund, W
+    ADDLW   0x30
+    CALL    UART_CHAR
+    MOVF    bcd_tens, W
+    ADDLW   0x30
+    CALL    UART_CHAR
+    MOVF    bcd_ones, W
+    ADDLW   0x30
+    CALL    UART_CHAR
+    MOVLW   ' '
+    CALL    UART_CHAR
+
+    ; MODE=
+    MOVLW   'M'
+    CALL    UART_CHAR
+    MOVLW   'O'
+    CALL    UART_CHAR
+    MOVLW   'D'
+    CALL    UART_CHAR
+    MOVLW   'E'
+    CALL    UART_CHAR
+    MOVLW   '='
+    CALL    UART_CHAR
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    BTFSS   mode_state, 0
+    GOTO    UR_MODE_N
+    MOVLW   'S'
+    CALL    UART_CHAR
+    MOVLW   'A'
+    CALL    UART_CHAR
+    MOVLW   'V'
+    CALL    UART_CHAR
+    MOVLW   'E'
+    CALL    UART_CHAR
+    MOVLW   ' '
+    CALL    UART_CHAR
+    MOVLW   ' '
+    CALL    UART_CHAR
+    GOTO    UR_MODE_DONE
+UR_MODE_N:
+    MOVLW   'N'
+    CALL    UART_CHAR
+    MOVLW   'O'
+    CALL    UART_CHAR
+    MOVLW   'R'
+    CALL    UART_CHAR
+    MOVLW   'M'
+    CALL    UART_CHAR
+    MOVLW   'A'
+    CALL    UART_CHAR
+    MOVLW   'L'
+    CALL    UART_CHAR
+UR_MODE_DONE:
+    MOVLW   ' '
+    CALL    UART_CHAR
+
+    ; FAULT= LM35 or NONE
+    MOVLW   'F'
+    CALL    UART_CHAR
+    MOVLW   'A'
+    CALL    UART_CHAR
+    MOVLW   'U'
+    CALL    UART_CHAR
+    MOVLW   'L'
+    CALL    UART_CHAR
+    MOVLW   'T'
+    CALL    UART_CHAR
+    MOVLW   '='
+    CALL    UART_CHAR
+    BCF     STATUS, RP0
+    BCF     STATUS, RP1
+    MOVF    fault_active, F
+    BTFSC   STATUS, Z
+    GOTO    UR_FAULT_NONE
+    ; fault_active = 1: LM35 fault
+    MOVLW   'L'
+    CALL    UART_CHAR
+    MOVLW   'M'
+    CALL    UART_CHAR
+    MOVLW   '3'
+    CALL    UART_CHAR
+    MOVLW   '5'
+    CALL    UART_CHAR
+    MOVLW   ' '
+    CALL    UART_CHAR
+    GOTO    UR_CRLF
+UR_FAULT_NONE:
+    MOVLW   'N'
+    CALL    UART_CHAR
+    MOVLW   'O'
+    CALL    UART_CHAR
+    MOVLW   'N'
+    CALL    UART_CHAR
+    MOVLW   'E'
+    CALL    UART_CHAR
+    MOVLW   ' '
+    CALL    UART_CHAR
+UR_CRLF:
+    MOVLW   0x0D
+    CALL    UART_CHAR
+    MOVLW   0x0A
+    CALL    UART_CHAR
+    RETURN
+
+; ==============================================================================
+; BIN2BCD_8BIT - Convert math_val (0-255) to bcd_hund, bcd_tens, bcd_ones
+; ==============================================================================
+BIN2BCD_8BIT:
+    CLRF    bcd_hund
+    CLRF    bcd_tens
+    CLRF    bcd_ones
+BCD_H:
+    MOVLW   d'100'
+    SUBWF   math_val, W
+    BTFSS   STATUS, C
+    GOTO    BCD_T
+    MOVWF   math_val
+    INCF    bcd_hund, F
+    GOTO    BCD_H
+BCD_T:
+    MOVLW   d'10'
+    SUBWF   math_val, W
+    BTFSS   STATUS, C
+    GOTO    BCD_O
+    MOVWF   math_val
+    INCF    bcd_tens, F
+    GOTO    BCD_T
+BCD_O:
+    MOVF    math_val, W
+    MOVWF   bcd_ones
+    RETURN
+
+; ==============================================================================
+; LCD_INIT - 4-bit initialisation sequence
+; ==============================================================================
+LCD_INIT:
+    BCF     LCD_RS
+    NOP
+    MOVLW   0x03
+    CALL    LCD_NIBBLE
+    CALL    DELAY_5MS
+    MOVLW   0x03
+    CALL    LCD_NIBBLE
+    CALL    DELAY_100US
+    MOVLW   0x03
+    CALL    LCD_NIBBLE
+    CALL    DELAY_100US
+    MOVLW   0x02
+    CALL    LCD_NIBBLE
+    CALL    DELAY_100US
+    MOVLW   0x28
+    CALL    LCD_CMD
+    MOVLW   0x0C
+    CALL    LCD_CMD
+    MOVLW   0x06
+    CALL    LCD_CMD
+    RETURN
+
+; ==============================================================================
+; LCD_CMD - send command byte in W (RS=0)
+; ==============================================================================
+LCD_CMD:
+    MOVWF   lcd_data
+    BCF     LCD_RS
+    NOP
+    SWAPF   lcd_data, W
+    ANDLW   0x0F
+    CALL    LCD_NIBBLE
+    MOVF    lcd_data, W
+    ANDLW   0x0F
+    CALL    LCD_NIBBLE
+    CALL    DELAY_100US
+    RETURN
+
+; ==============================================================================
+; LCD_CHAR - send data byte in W (RS=1)
+; ==============================================================================
+LCD_CHAR:
+    MOVWF   lcd_data
+    BSF     LCD_RS
+    NOP
+    SWAPF   lcd_data, W
+    ANDLW   0x0F
+    CALL    LCD_NIBBLE
+    MOVF    lcd_data, W
+    ANDLW   0x0F
+    CALL    LCD_NIBBLE
+    CALL    DELAY_100US
+    RETURN
+
+; ==============================================================================
+; LCD_NIBBLE - send lower 4 bits of W to LCD data pins, pulse EN
+; ==============================================================================
+LCD_NIBBLE:
+    MOVWF   lcd_temp
+    MOVF    LCD_PORT, W
+    ANDLW   0xF0
+    IORWF   lcd_temp, W
+    MOVWF   LCD_PORT
+    BSF     LCD_EN
+    NOP
+    NOP
+    BCF     LCD_EN
+    RETURN
+
+; ==============================================================================
+; Delay subroutines (startup and ADC settling only)
+; ==============================================================================
+DELAY_100MS:
+    MOVLW   d'100'
+    GOTO    DELAY_MS_LOOP
+DELAY_15MS:
+    MOVLW   d'15'
+    GOTO    DELAY_MS_LOOP
+DELAY_5MS:
+    MOVLW   d'5'
+    GOTO    DELAY_MS_LOOP
+DELAY_MS_LOOP:
+    MOVWF   d2
+DMS_O:
+    MOVLW   d'249'
+    MOVWF   d1
+DMS_I:
+    NOP
+    DECFSZ  d1, F
+    GOTO    DMS_I
+    DECFSZ  d2, F
+    GOTO    DMS_O
+    RETURN
+
+DELAY_100US:
+    MOVLW   d'33'
+    MOVWF   d1
+DUS:
+    DECFSZ  d1, F
+    GOTO    DUS
+    RETURN
+
+    END
